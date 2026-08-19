@@ -1,0 +1,146 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // =========================================================================
+    // HELPER FUNCTIONS
+    // =========================================================================
+
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isOwner(uid) {
+      return request.auth.uid == uid;
+    }
+
+    // Reads the caller's user doc to get their role ('user' | 'admin').
+    // Costs 1 extra read per rule evaluation that calls isAdmin().
+    function callerRole() {
+      return get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role;
+    }
+
+    function isAdmin() {
+      return isSignedIn() && callerRole() == 'admin';
+    }
+
+    // =========================================================================
+    // /users/{userId}
+    // =========================================================================
+    match /users/{userId} {
+
+      // Users read their own doc; admins read any doc.
+      allow read: if isSignedIn() && (isOwner(userId) || isAdmin());
+
+      // On sign-up: user creates their own doc.
+      // - The doc ID must match their UID.
+      // - Required fields must be present.
+      // - Role is always forced to 'user' on creation.
+      allow create: if isSignedIn()
+                    && isOwner(userId)
+                    && request.resource.data.keys().hasAll([
+                         'uid', 'email', 'displayName', 'role', 'createdAt'
+                       ])
+                    && request.resource.data.role == 'user';
+
+      // Users can only update their own display name / photo.
+      // Admins can update anything (role, status, etc.).
+      allow update: if isSignedIn() && (
+          (isOwner(userId)
+            && request.resource.data.diff(resource.data).affectedKeys()
+                 .hasOnly(['displayName', 'photoURL', 'updatedAt']))
+          || isAdmin()
+      );
+
+      // Only admins can delete user documents.
+      allow delete: if isAdmin();
+    }
+
+    // =========================================================================
+    // /complaints/{complaintId}
+    // =========================================================================
+    match /complaints/{complaintId} {
+
+      // Owner can read their own complaint; admins can read all.
+      allow read: if isSignedIn()
+                  && (resource.data.userId == request.auth.uid || isAdmin());
+
+      // Any signed-in user can submit a complaint.
+      // userId field must match the caller's own UID.
+      allow create: if isSignedIn()
+                    && request.resource.data.userId == request.auth.uid;
+
+      // Owner can only update feedback fields after resolution.
+      // Admins can update anything (status, notes, assignment, etc.).
+      allow update: if isSignedIn() && (
+          (resource.data.userId == request.auth.uid
+            && request.resource.data.diff(resource.data).affectedKeys()
+                 .hasOnly(['userRating', 'userFeedback', 'updatedAt']))
+          || isAdmin()
+      );
+
+      // Only admins can delete complaints.
+      allow delete: if isAdmin();
+    }
+
+    // =========================================================================
+    // /categories/{categoryId}
+    // =========================================================================
+    match /categories/{categoryId} {
+
+      // Any signed-in user can read categories (needed for dropdowns).
+      allow read: if isSignedIn();
+
+      // Only admins can create, update, or delete categories.
+      allow write: if isAdmin();
+    }
+
+    // =========================================================================
+    // /groupComplaints/{complaintId}   ← Petition / Group Complaint system
+    // =========================================================================
+    match /groupComplaints/{complaintId} {
+
+      // Any signed-in user can read a group complaint.
+      // This is needed for the shareable signing link — anyone with the link
+      // must be able to view the petition details before deciding to sign.
+      allow read: if isSignedIn();
+
+      // Any signed-in user can create a group complaint (petition).
+      // creatorId must match the caller's UID.
+      allow create: if isSignedIn()
+                    && request.resource.data.creatorId == request.auth.uid;
+
+      // UPDATE rules — two separate cases:
+      allow update: if isSignedIn() && (
+
+          // ── Case 1: Signing / supporting a petition ──────────────────────
+          // Any authenticated user (who is NOT the creator) can sign a petition.
+          // They may only touch the supporter-related fields.
+          (resource.data.creatorId != request.auth.uid
+            && request.resource.data.diff(resource.data).affectedKeys()
+                 .hasOnly([
+                   'supporters',
+                   'supporterDetails',
+                   'supporterCount',
+                   'isDhamaka',
+                   'updatedAt'
+                 ]))
+
+          // ── Case 2: Admin management ──────────────────────────────────────
+          // Admins can update anything (status, etc.).
+          || isAdmin()
+      );
+
+      // Only admins can delete group complaints.
+      allow delete: if isAdmin();
+    }
+
+    // =========================================================================
+    // DENY EVERYTHING ELSE (belt-and-suspenders catch-all)
+    // =========================================================================
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}
