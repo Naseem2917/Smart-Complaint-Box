@@ -1,8 +1,8 @@
-const CLOUDFLARE_WORKER_URL = 'https://complaintbox.khannaseem1704.workers.dev';
+const CLOUDFLARE_WORKER_URL = 'https://complaintbox.naseem2917.workers.dev';
 
 import type { AIAnalysisResponse, LiveAnalysisResponse, Complaint } from '../types';
 
-// Helper to call the new generic worker
+// Helper to call the AI worker
 async function callAI(prompt: string, systemInstruction: string): Promise<string> {
     const response = await fetch(CLOUDFLARE_WORKER_URL, {
         method: 'POST',
@@ -17,7 +17,20 @@ async function callAI(prompt: string, systemInstruction: string): Promise<string
 
     const data = await response.json();
 
-    // Extract text from Gemini response format
+    // Log model used and latency if available
+    if (data.modelUsed) {
+        console.log(`[AI Worker] Handled by ${data.modelUsed} in ${data.latencyMs}ms`);
+    }
+
+    // Direct text response from optimized worker
+    if (data.text) {
+        return data.text;
+    }
+    if (data.response) {
+        return data.response;
+    }
+
+    // Fallback extract text from raw Gemini response format
     if (data.candidates?.[0]?.content?.parts?.[0]?.text) {
         return data.candidates[0].content.parts[0].text;
     }

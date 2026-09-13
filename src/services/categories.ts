@@ -47,27 +47,34 @@ export const getCategories = async (): Promise<Category[]> => {
 
     const snapshot = await getDocs(q);
 
-    // If no categories exist, seed with defaults
+    // If no categories exist, attempt to seed with defaults (admin only)
     if (snapshot.empty) {
-        await seedCategories();
-        return getCategories();
+        try {
+            await seedCategories();
+            return getCategories();
+        } catch (seedError) {
+            console.warn('Could not auto-seed categories (requires admin):', seedError);
+        }
     }
 
-    // Get all complaints to count per category
-    const complaintsSnapshot = await getDocs(collection(db, 'complaints'));
+    // Safely attempt to get complaint counts (will only succeed if caller is admin)
     const categoryCounts: Record<string, number> = {};
-
-    complaintsSnapshot.docs.forEach(doc => {
-        const category = doc.data().category;
-        if (category) {
-            categoryCounts[category] = (categoryCounts[category] || 0) + 1;
-        }
-    });
+    try {
+        const complaintsSnapshot = await getDocs(collection(db, 'complaints'));
+        complaintsSnapshot.docs.forEach(doc => {
+            const category = doc.data().category;
+            if (category) {
+                categoryCounts[category] = (categoryCounts[category] || 0) + 1;
+            }
+        });
+    } catch {
+        // Regular users cannot read all complaints per security rules; safely continue
+    }
 
     return snapshot.docs.map(doc => ({
         id: doc.id,
         ...doc.data(),
-        complaintCount: categoryCounts[doc.data().name] || 0  // Use actual count
+        complaintCount: categoryCounts[doc.data().name] || 0
     } as Category));
 };
 

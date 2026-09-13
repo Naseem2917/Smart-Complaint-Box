@@ -1,55 +1,46 @@
 /**
  * Smart Complaint Box - Cloudflare Worker
  * 
- * This worker acts as a proxy for the Gemini API to keep the API key secure.
- * Deploy this to Cloudflare Workers with your Gemini API key as an environment variable.
- * 
- * Environment Variables Required:
- * - GEMINI_API_KEY: Your Google Gemini API key
+ * Multi-model Gemini AI proxy with intelligent fallback chain,
+ * header authentication, and per-model timeout handling.
  */
 
-const GEMINI_API_URL = 'https://generativelanguage.googleapis.com/v1beta/models/gemini-pro:generateContent';
-
-// CORS headers for all responses
-const corsHeaders = {
+const CORS_HEADERS = {
     'Access-Control-Allow-Origin': '*',
     'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
-    'Access-Control-Allow-Headers': 'Content-Type',
+    'Access-Control-Allow-Headers': 'Content-Type, Authorization',
 };
 
-// Handle OPTIONS preflight requests
-function handleOptions() {
-    return new Response(null, { headers: corsHeaders });
+// ── Model constants (exact PromptWise models) ─────────────────────────────────
+
+const MODEL_LITE = 'gemini-3.5-flash-lite';
+const MODEL_MID  = 'gemini-3.6-flash';
+const MODEL_HIGH = 'gemini-3.7-flash';
+
+/**
+ * Single, optimized fallback chain:
+ * 1. Fast & responsive: gemini-3.5-flash-lite (~900ms)
+ * 2. Overload / rate-limit fallback: gemini-3.6-flash
+ * 3. High reasoning fallback: gemini-3.7-flash
+ */
+const FALLBACK_MODELS = [MODEL_LITE, MODEL_MID, MODEL_HIGH];
+
+// ── Helpers ───────────────────────────────────────────────────────────────────
+
+/**
+ * Returns true if the HTTP status code signals a transient/overload error
+ * that warrants trying the next model in the fallback chain.
+ * Non-retryable errors (401, 403, 400, etc.) will NOT trigger a model switch.
+ */
+function isRetryableStatus(status) {
+    return [429, 500, 502, 503, 504].includes(status);
 }
 
-// Call Gemini API
-async function callGemini(prompt, apiKey) {
-    const response = await fetch(`${GEMINI_API_URL}?key=${apiKey}`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-            contents: [{ parts: [{ text: prompt }] }],
-            generationConfig: {
-                temperature: 0.7,
-                maxOutputTokens: 1024,
-            },
-        }),
-    });
-
-    const data = await response.json();
-
-    if (data.candidates && data.candidates[0]?.content?.parts?.[0]?.text) {
-        return data.candidates[0].content.parts[0].text;
-    }
-
-    throw new Error('Invalid response from Gemini API');
-}
-
-// Parse JSON from Gemini response
+// Parse JSON safely from markdown or plain text response
 function parseJSON(text) {
     try {
-        // Try to extract JSON from the response
-        const jsonMatch = text.match(/\{[\s\S]*\}/);
+        const cleanText = text.replace(/```json\n?/g, '').replace(/```\n?/g, '').trim();
+        const jsonMatch = cleanText.match(/\{[\s\S]*\}/);
         if (jsonMatch) {
             return JSON.parse(jsonMatch[0]);
         }
@@ -59,284 +50,265 @@ function parseJSON(text) {
     }
 }
 
-// Handlers for each endpoint
-const handlers = {
-    // Live analysis while typing
-    async 'live-analyze'(body, apiKey) {
-        const { text } = body;
+// ── Core Gemini caller (single model, with timeout & header auth) ─────────────
 
-        const prompt = `Analyze this complaint text and provide quick categorization.
-Text: "${text}"
+const REQUEST_TIMEOUT_MS = 20_000; // 20 s per-model timeout
 
-Respond in JSON format only:
-{
-  "category": "one of: Plumbing, Electrical, Infrastructure, Cleanliness, Security, IT/Network, Food, Transportation, Other",
-  "priority": "one of: Low, Medium, High, Critical",
-  "suggestedImage": "brief suggestion for what photo would help, or empty string if not needed"
-}`;
+async function callGemini(apiKey, model, userPrompt, systemPrompt = '') {
+    const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`;
 
-        const response = await callGemini(prompt, apiKey);
-        const parsed = parseJSON(response);
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
 
-        return parsed || {
-            category: 'General',
-            priority: 'Medium',
-            suggestedImage: ''
+    let response;
+    try {
+        const bodyPayload = {
+            contents: [{ parts: [{ text: userPrompt }] }],
+            generationConfig: {
+                temperature: 0.3,
+            },
         };
-    },
 
-    // Full complaint analysis
-    async 'analyze'(body, apiKey) {
-        const { description, imageUrl } = body;
+        if (systemPrompt) {
+            bodyPayload.systemInstruction = { parts: [{ text: systemPrompt }] };
+        }
 
-        const prompt = `You are an AI complaint analyzer for a college/society complaint management system.
-    
-Analyze this complaint:
-Description: "${description}"
-${imageUrl ? `Image URL: ${imageUrl}` : 'No image attached'}
+        response = await fetch(url, {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+                'x-goog-api-key': apiKey, // Key in header, NOT in URL query string
+            },
+            body: JSON.stringify(bodyPayload),
+            signal: controller.signal,
+        });
+    } finally {
+        clearTimeout(timer);
+    }
 
-Provide a comprehensive analysis in JSON format:
-{
-  "category": "one of: Plumbing, Electrical, Infrastructure, Cleanliness, Security, IT/Network, Food, Transportation, Hostel, Academic, Other",
-  "urgency": "one of: Low, Medium, High, Critical",
-  "priorityScore": number between 0-100 based on urgency, impact, and safety concerns,
-  "priorityReason": ["array of 2-3 short reasons for the priority score"],
-  "aiSummary": "A brief 1-2 sentence summary of the complaint",
-  "suggestedAssignment": "suggested department or role: Maintenance Staff, Electrician, Housekeeping, Security, IT Support, Admin Office, etc.",
-  "statusExplanation": "A reassuring message explaining what will happen next, in friendly tone",
-  "detectedObjects": [{"label": "string", "confidence": number 0-100}] // Only if image was mentioned
+    if (!response.ok) {
+        const errBody = await response.text().catch(() => response.statusText);
+        const err = new Error(`Gemini ${response.status}: ${errBody}`);
+        err.status = response.status;
+        throw err;
+    }
+
+    const data = await response.json();
+    return data.candidates?.[0]?.content?.parts?.[0]?.text || 'No response generated.';
 }
 
-Consider these factors for priority:
-- Safety hazards = very high priority
-- Water/electricity issues = high priority
-- Multiple people affected = higher priority
-- Urgent language = higher priority
-- Repeated issues = higher priority`;
+// ── Multi-model caller with immediate fallback ───────────────────────────────
 
-        const response = await callGemini(prompt, apiKey);
-        const parsed = parseJSON(response);
+async function callWithModelList(apiKey, models, userPrompt, systemPrompt = '') {
+    let lastError = new Error('No models available');
 
-        return parsed || {
-            category: 'General',
-            urgency: 'Medium',
-            priorityScore: 50,
-            priorityReason: ['Standard complaint'],
-            aiSummary: description.slice(0, 100),
-            suggestedAssignment: 'General Support',
-            statusExplanation: 'Your complaint has been received and will be reviewed shortly.'
-        };
-    },
+    for (const model of models) {
+        const start = Date.now();
+        try {
+            const text = await callGemini(apiKey, model, userPrompt, systemPrompt);
+            return { text, modelUsed: model, latencyMs: Date.now() - start };
+        } catch (err) {
+            lastError = err;
 
-    // Human-friendly status explanation
-    async 'status-explain'(body, apiKey) {
-        const { complaint, status } = body;
+            // Abort = timeout → try next model immediately
+            if (err.name === 'AbortError') {
+                console.warn(`[Gemini] ${model} timed out. Trying next model…`);
+                continue;
+            }
 
-        const prompt = `Generate a friendly, reassuring explanation for a complaint status update.
+            // Retryable server/overload error → try next model immediately
+            if (err.status !== undefined && isRetryableStatus(err.status)) {
+                console.warn(`[Gemini] ${model} returned ${err.status}. Trying next model…`);
+                continue;
+            }
 
-Complaint: "${complaint.description?.slice(0, 200) || 'General complaint'}"
-Category: ${complaint.category || 'General'}
-New Status: ${status}
-
-Write a 2-3 sentence explanation that:
-- Is warm and reassuring
-- Explains what this status means
-- Sets appropriate expectations
-- Uses simple language
-
-Respond with just the explanation text, no JSON.`;
-
-        const response = await callGemini(prompt, apiKey);
-        return { explanation: response.trim() };
-    },
-
-    // Generate email draft
-    async 'generate-email'(body, apiKey) {
-        const { complaint, type } = body;
-
-        const tones = {
-            strict: 'formal and firm, emphasizing urgency and accountability',
-            friendly: 'polite and gentle, serving as a friendly reminder',
-            report: 'professional and factual, suitable for official documentation'
-        };
-
-        const prompt = `Generate an email draft for a complaint that is ${tones[type] || 'professional'}.
-
-Complaint Details:
-- Category: ${complaint.category}
-- Priority: ${complaint.urgency}
-- Description: ${complaint.description}
-- Status: ${complaint.status}
-
-Write a complete email with Subject line, greeting, body, and signature.
-The email should be addressed to the relevant authority.`;
-
-        const response = await callGemini(prompt, apiKey);
-        return { email: response.trim() };
-    },
-
-    // User AI chat
-    async 'user-chat'(body, apiKey) {
-        const { query, complaints } = body;
-
-        const complaintsContext = complaints
-            ?.slice(0, 5)
-            .map(c => `- ${c.category}: ${c.status} (${c.aiSummary || c.description?.slice(0, 50)})`)
-            .join('\n') || 'No complaints';
-
-        const prompt = `You are a helpful AI assistant for a complaint management system.
-    
-User's complaints:
-${complaintsContext}
-
-User asks: "${query}"
-
-Provide a helpful, friendly response about their complaints, status, or general questions about the system.
-Keep the response concise (2-4 sentences max).
-If you don't have information, politely say so.`;
-
-        const response = await callGemini(prompt, apiKey);
-        return { response: response.trim() };
-    },
-
-    // Personal report
-    async 'personal-report'(body, apiKey) {
-        const { complaints } = body;
-
-        const stats = {
-            total: complaints?.length || 0,
-            resolved: complaints?.filter(c => c.status === 'Resolved').length || 0,
-            pending: complaints?.filter(c => c.status === 'Pending').length || 0
-        };
-
-        const prompt = `Generate a brief monthly report summary for a user.
-
-Stats:
-- Total complaints: ${stats.total}
-- Resolved: ${stats.resolved}
-- Pending: ${stats.pending}
-
-Provide a friendly 2-3 sentence summary and insights.
-Respond in JSON format:
-{
-  "summary": "Your monthly summary text",
-  "insights": ["insight 1", "insight 2"]
-}`;
-
-        const response = await callGemini(prompt, apiKey);
-        const parsed = parseJSON(response);
-
-        return {
-            summary: parsed?.summary || 'No activity this month.',
-            stats,
-            insights: parsed?.insights || []
-        };
-    },
-
-    // Admin insights
-    async 'admin-insights'(body, apiKey) {
-        const { complaints } = body;
-
-        const categories = {};
-        complaints?.forEach(c => {
-            categories[c.category] = (categories[c.category] || 0) + 1;
-        });
-
-        const topCategory = Object.entries(categories).sort((a, b) => b[1] - a[1])[0];
-
-        const prompt = `Based on complaint data, provide brief admin insights.
-
-Data:
-- Total complaints: ${complaints?.length || 0}
-- Top category: ${topCategory?.[0] || 'N/A'} (${topCategory?.[1] || 0} complaints)
-- Pending: ${complaints?.filter(c => c.status === 'Pending').length || 0}
-
-Respond in JSON:
-{
-  "mostCommonIssue": "brief description",
-  "hotspotArea": "area or department with most issues",
-  "trends": "brief trend observation"
-}`;
-
-        const response = await callGemini(prompt, apiKey);
-        const parsed = parseJSON(response);
-
-        return parsed || {
-            mostCommonIssue: topCategory?.[0] || 'General Issues',
-            hotspotArea: 'Analysis pending',
-            trends: 'Insufficient data'
-        };
-    },
-
-    // Generate follow-up reminder
-    async 'generate-reminder'(body, apiKey) {
-        const { complaint } = body;
-
-        const prompt = `Generate a polite follow-up reminder for an unresolved complaint.
-
-Complaint: ${complaint.category} - ${complaint.aiSummary || complaint.description?.slice(0, 100)}
-Days pending: approximately ${Math.floor((Date.now() - (complaint.createdAt?._seconds * 1000 || Date.now())) / (1000 * 60 * 60 * 24))} days
-
-Write a short, polite reminder (2-3 sentences) requesting status update.`;
-
-        const response = await callGemini(prompt, apiKey);
-        return { reminder: response.trim() };
+            // Non-retryable (401 bad key, 400 bad request, etc.) → stop immediately
+            console.error(`[Gemini] ${model} returned non-retryable error ${err.status ?? 'unknown'}. Aborting fallback.`);
+            throw err;
+        }
     }
-};
 
-// Main request handler
+    throw lastError;
+}
+
+// ── Main handler ─────────────────────────────────────────────────────────────
+
 export default {
     async fetch(request, env) {
-        // Handle CORS preflight
-        if (request.method === 'OPTIONS') {
-            return handleOptions();
-        }
-
         const url = new URL(request.url);
-        const path = url.pathname.replace(/^\//, '');
 
-        // Health check
-        if (path === '' || path === 'health') {
-            return new Response(JSON.stringify({ status: 'ok', endpoints: Object.keys(handlers) }), {
-                headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        // CORS preflight
+        if (request.method === 'OPTIONS') {
+            return new Response(null, {
+                status: 204,
+                headers: CORS_HEADERS,
             });
         }
 
-        // Check if endpoint exists
-        if (!handlers[path]) {
-            return new Response(JSON.stringify({ error: 'Endpoint not found' }), {
-                status: 404,
-                headers: { ...corsHeaders, 'Content-Type': 'application/json' }
-            });
+        // ── GET Health Check ─────────────────────────────────────────────────
+        if (request.method === 'GET') {
+            return Response.json(
+                {
+                    success: true,
+                    status: 'ok',
+                    service: 'Smart Complaint Box AI Worker',
+                    models: FALLBACK_MODELS,
+                },
+                { headers: CORS_HEADERS }
+            );
         }
 
-        // Only accept POST requests
         if (request.method !== 'POST') {
-            return new Response(JSON.stringify({ error: 'Method not allowed' }), {
+            return new Response('Method Not Allowed', {
                 status: 405,
-                headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+                headers: CORS_HEADERS,
             });
+        }
+
+        const apiKey = env.GEMINI_API_KEY;
+        if (!apiKey) {
+            return Response.json(
+                { error: 'Configuration Error: Missing GEMINI_API_KEY in Cloudflare Worker' },
+                { status: 500, headers: CORS_HEADERS }
+            );
         }
 
         try {
-            const body = await request.json();
-            const apiKey = env.GEMINI_API_KEY;
+            const body = await request.json().catch(() => ({}));
+            const pathname = url.pathname.replace(/^\/+/, '');
 
-            if (!apiKey) {
-                throw new Error('GEMINI_API_KEY not configured');
+            // ── Route: /live-analyze ─────────────────────────────────────────
+            if (pathname === 'live-analyze' || pathname.endsWith('/live-analyze')) {
+                const text = body.text || body.prompt || '';
+                const prompt = `Analyze this complaint text:
+"${text}"
+
+First check if this is a VALID complaint (meaningful text about an issue).
+If it's gibberish, random characters, test text, or not a real complaint, set isValid to false.
+
+Respond with JSON only:
+{
+  "isValid": true/false,
+  "category": "one of: Water Supply, Electricity, Roads & Infrastructure, Sanitation, Security, Classroom, General, Other",
+  "priority": "one of: Low, Medium, High, Critical",
+  "suggestedImage": "brief suggestion for what photo would help, or empty string"
+}`;
+                const systemPrompt = `You are a complaint analyzer. Analyze the text and respond ONLY with valid JSON, no other text.`;
+                const { text: resultText, modelUsed, latencyMs } = await callWithModelList(apiKey, FALLBACK_MODELS, prompt, systemPrompt);
+                const parsed = parseJSON(resultText);
+
+                return Response.json(
+                    parsed || { isValid: false, category: 'General', priority: 'Medium', suggestedImage: '', modelUsed, latencyMs },
+                    { headers: CORS_HEADERS }
+                );
             }
 
-            const result = await handlers[path](body, apiKey);
+            // ── Route: /analyze ──────────────────────────────────────────────
+            if (pathname === 'analyze' || pathname.endsWith('/analyze')) {
+                const { description, imageUrl } = body;
+                const prompt = `Analyze this complaint:
+Description: "${description || body.prompt || ''}"
+${imageUrl ? `Image attached: yes` : 'No image attached'}
 
-            return new Response(JSON.stringify(result), {
-                headers: { ...corsHeaders, 'Content-Type': 'application/json' }
-            });
-        } catch (error) {
-            console.error('Error:', error);
-            return new Response(JSON.stringify({ error: error.message || 'Internal server error' }), {
-                status: 500,
-                headers: { ...corsHeaders, 'Content-Type': 'application/json' }
-            });
+Respond with JSON only:
+{
+  "category": "one of: Water Supply, Electricity, Roads & Infrastructure, Sanitation, Security, Classroom, General, Other",
+  "urgency": "one of: Low, Medium, High, Critical",
+  "priorityScore": number 0-100,
+  "priorityReason": ["reason1", "reason2"],
+  "aiSummary": "1-2 sentence summary",
+  "suggestedAssignment": "department or role",
+  "statusExplanation": "reassuring message for user"
+}`;
+                const systemPrompt = `You are an AI complaint analyzer for a college/society complaint management system. Analyze complaints and respond ONLY with valid JSON.`;
+                const { text: resultText, modelUsed, latencyMs } = await callWithModelList(apiKey, FALLBACK_MODELS, prompt, systemPrompt);
+                const parsed = parseJSON(resultText);
+
+                return Response.json(
+                    parsed || {
+                        category: 'General',
+                        urgency: 'Medium',
+                        priorityScore: 50,
+                        priorityReason: ['Standard complaint'],
+                        aiSummary: (description || '').slice(0, 100),
+                        suggestedAssignment: 'General Support',
+                        statusExplanation: 'Your complaint has been received and will be reviewed shortly.',
+                        modelUsed,
+                        latencyMs,
+                    },
+                    { headers: CORS_HEADERS }
+                );
+            }
+
+            // ── Route: /user-chat or /chat ────────────────────────────────────
+            if (pathname === 'user-chat' || pathname.endsWith('/chat')) {
+                const userQuery = body.query || body.prompt || '';
+                const complaintsContext = body.complaints
+                    ?.slice(0, 5)
+                    .map(c => `- ${c.category}: ${c.status} (${c.aiSummary || c.description?.slice(0, 50)})`)
+                    .join('\n') || 'No complaints';
+
+                const prompt = `User's recent complaints:
+${complaintsContext}
+
+User asks: "${userQuery}"
+
+Provide a helpful, friendly response (2-4 sentences max). If you don't have information, say so politely.`;
+                const systemPrompt = `You are a helpful AI assistant for a complaint management system. Be friendly and concise.`;
+
+                const { text: resultText, modelUsed, latencyMs } = await callWithModelList(apiKey, FALLBACK_MODELS, prompt, systemPrompt);
+                return Response.json(
+                    { success: true, text: resultText, response: resultText, modelUsed, latencyMs },
+                    { headers: CORS_HEADERS }
+                );
+            }
+
+            // ── Generic AI Endpoint (Default for frontend callAI & /api/generate) ──
+            const prompt = body.prompt || body.query || body.userPrompt || body.text || '';
+            const systemPrompt = body.systemInstruction || body.systemPrompt || '';
+
+            if (!prompt.trim()) {
+                return Response.json(
+                    { error: 'Prompt is required.' },
+                    { status: 400, headers: CORS_HEADERS }
+                );
+            }
+
+            const { text, modelUsed, latencyMs } = await callWithModelList(
+                apiKey,
+                FALLBACK_MODELS,
+                prompt,
+                systemPrompt
+            );
+
+            console.log(`[Complaint AI] model=${modelUsed} latency=${latencyMs}ms`);
+
+            return Response.json(
+                {
+                    success: true,
+                    text,
+                    response: text,
+                    modelUsed,
+                    latencyMs,
+                    // Backward-compatible candidates field for legacy callers:
+                    candidates: [
+                        {
+                            content: {
+                                parts: [{ text }],
+                            },
+                        },
+                    ],
+                },
+                { headers: CORS_HEADERS }
+            );
+
+        } catch (err) {
+            const msg = err?.message || String(err);
+            console.error('[Worker Error]', msg);
+            return Response.json(
+                { error: `AI Service Error: ${msg}` },
+                { status: 500, headers: CORS_HEADERS }
+            );
         }
-    }
+    },
 };
