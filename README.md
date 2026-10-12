@@ -83,7 +83,7 @@
 
 ```bash
 # Clone the repository
-git clone https://github.com/naseem-2917/Smart-Complaint-Box.git
+git clone https://github.com/naseem2917/Smart-Complaint-Box.git
 
 # Navigate to project
 cd Smart-Complaint-Box
