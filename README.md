@@ -246,11 +246,13 @@ MIT License - feel free to use for your projects!
 
 ---
 
-## 👨‍💻 Author
+## 👥 Authors & Team
 
-**Naseem**
+This project was built collaboratively by:
 
-- GitHub: [@naseem-2917](https://github.com/naseem-2917)
+- **Naseem** — [@Naseem2917](https://github.com/Naseem2917/)
+- **Ankit Shrivastava** — [@shrivastavaankit-2006](https://github.com/shrivastavaankit-2006/)
+- **Shani** — [@shani0136](https://github.com/shani0136/)
 
 ---
 
